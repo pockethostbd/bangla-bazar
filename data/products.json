@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "products": [
     {
       "id": "islamic-history-1-5",
@@ -8,7 +8,7 @@
       "category": "Islamic",
       "price": 0,
       "oldPrice": 0,
-      "image": "",
+      "image": "https://pockethostbd.github.io/drive-one/picture/islamer-etihash-1-5.jpg",
       "images": [],
       "youtube": [],
       "description": "content/islamic-history-1-5.md"
