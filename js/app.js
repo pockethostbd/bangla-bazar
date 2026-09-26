@@ -1,221 +1,44 @@
-(function(){
-'use strict';
-
-const CFG=window.BB_FIREBASE_CONFIG||{};
-const WHATSAPP_NUMBER='8801949737370';
-const LS={cart:'bb_cart_v3',wish:'bb_wish_v3',site:'bb_site_v3'};
-let db=null,auth=null,productsCache=null,authReady=null;
-
-try{
-  if(window.firebase){
-    if(!firebase.apps.length) firebase.initializeApp(CFG);
-    auth=firebase.auth();
-    db=firebase.firestore();
-    authReady=new Promise(resolve=>auth.onAuthStateChanged(resolve));
-  }
-}catch(e){console.warn('Firebase initialization failed:',e)}
-
-const $=s=>document.querySelector(s);
-const $$=s=>[...document.querySelectorAll(s)];
-const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
-const safeUrl=s=>String(s||'').replace(/javascript:/gi,'');
-
-function isProductPage(){return /\/products\/[^/]+\.html$/i.test(location.pathname)}
-function rootPrefix(){return isProductPage()?'../':''}
-function productHref(p){return rootPrefix()+'products/'+encodeURIComponent(String(p.slug||p.id))+'.html'}
-function siteUrl(path){return new URL(rootPrefix()+path,location.href).href}
-
-function getSite(){try{return JSON.parse(localStorage.getItem(LS.site)||'{}')}catch{return {}}}
-function applySite(){
-  const s=getSite();
-  if(s.name) $$('#brandName').forEach(e=>e.textContent=s.name);
-  if(s.logo) $$('.brand-logo').forEach(e=>{e.innerHTML='<img src="'+esc(s.logo)+'" alt="Logo">'});
-  if(s.theme) document.documentElement.style.setProperty('--primary',s.theme);
-  if(s.button) document.documentElement.style.setProperty('--button',s.button);
-  if($('#heroTitle')&&s.heroTitle) $('#heroTitle').textContent=s.heroTitle;
-  if($('#heroText')&&s.heroText) $('#heroText').textContent=s.heroText;
-}
-
-function showLoader(v){const e=$('#app-loader');if(e)e.classList.toggle('hidden',!v)}
-function fmt(n){return '৳'+Number(n||0).toLocaleString('bn-BD')}
-
-async function loadProducts(force=false){
-  if(productsCache&&!force)return productsCache;
-  const url=new URL(rootPrefix()+'data/products.json',location.href).href+'?v='+Date.now();
-  try{
-    const r=await fetch(url,{cache:'no-store'});
-    if(!r.ok) throw Error('products '+r.status);
-    const j=await r.json();
-    productsCache=Array.isArray(j)?j:(j.products||[]);
-    return productsCache;
-  }catch(e){
-    console.error('Product catalog load failed:',e);
-    productsCache=[];
-    return [];
-  }
-}
-
-function card(p,compact=false){
-  const img=p.image||((p.images||[])[0]||'');
-  return `<article class="product-card ${compact?'compact':''}">
-    <a href="${productHref(p)}" class="product-image">${img?`<img loading="lazy" src="${esc(safeUrl(img))}" alt="${esc(p.title)}" onerror="this.parentElement.classList.add('broken');this.remove()">`:'<span>ছবি নেই</span>'}</a>
-    <div class="product-body">
-      <a class="product-title" href="${productHref(p)}">${esc(p.title)}</a>
-      <div class="price">${fmt(p.price)} ${p.oldPrice?`<del>${fmt(p.oldPrice)}</del>`:''}</div>
-      <div class="card-actions"><button class="mini-cart" data-add="${esc(p.id)}">কার্টে যোগ</button><button class="mini-wish" data-wish="${esc(p.id)}" aria-label="Wishlist">♡</button></div>
-    </div>
-  </article>`;
-}
-
-function localCart(){try{return JSON.parse(localStorage.getItem(LS.cart)||'{}')}catch{return {}}}
-function saveLocalCart(c){localStorage.setItem(LS.cart,JSON.stringify(c));updateCartCount()}
-function localWish(){try{return JSON.parse(localStorage.getItem(LS.wish)||'[]')}catch{return []}}
-
-async function waitAuth(){if(!auth)return null;if(authReady)return await authReady;return auth.currentUser}
-async function getUserDoc(uid){if(!db||!uid)return null;try{const s=await db.collection('users').doc(uid).get();return s.exists?s.data():null}catch(e){console.warn(e);return null}}
-async function getUserItems(type){
-  const u=await waitAuth();
-  if(!u||!db)return null;
-  try{const snap=await db.collection('users').doc(u.uid).collection(type).get();const out={};snap.forEach(d=>out[d.id]=d.data());return out}catch(e){console.warn(e);return null}
-}
-async function setUserItem(type,id,data){const u=await waitAuth();if(!u||!db)return false;try{await db.collection('users').doc(u.uid).collection(type).doc(id).set(data,{merge:true});return true}catch(e){console.warn(e);return false}}
-async function removeUserItem(type,id){const u=await waitAuth();if(!u||!db)return false;try{await db.collection('users').doc(u.uid).collection(type).doc(id).delete();return true}catch(e){console.warn(e);return false}}
-
-async function getCart(){const remote=await getUserItems('cart');return remote??localCart()}
-async function getWish(){const remote=await getUserItems('wishlist');if(remote)return Object.keys(remote);return localWish()}
-
-async function migrateLocalDataToFirebase(u){
-  if(!u||!db)return;
-  const c=localCart();
-  const w=localWish();
-  try{
-    const batch=db.batch();
-    Object.entries(c).forEach(([id,v])=>batch.set(db.collection('users').doc(u.uid).collection('cart').doc(id),{productId:id,quantity:Number(v?.quantity||v||1),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true}));
-    w.forEach(id=>batch.set(db.collection('users').doc(u.uid).collection('wishlist').doc(id),{productId:id,createdAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true}));
-    if(Object.keys(c).length||w.length) await batch.commit();
-    localStorage.removeItem(LS.cart);localStorage.removeItem(LS.wish);
-  }catch(e){console.warn('Local data migration:',e)}
-}
-
-async function addCart(id,qty=1){
-  const u=await waitAuth();
-  if(u&&db){const ref=db.collection('users').doc(u.uid).collection('cart').doc(id);const old=await ref.get();await ref.set({productId:id,quantity:(old.exists?Number(old.data().quantity||0):0)+qty,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true})}
-  else{const c=localCart();c[id]=Number(c[id]||0)+qty;saveLocalCart(c)}
-  updateCartCount();toast('কার্টে যোগ হয়েছে');
-}
-async function removeCart(id){const u=await waitAuth();if(u&&db)await removeUserItem('cart',id);else{const c=localCart();delete c[id];saveLocalCart(c)}updateCartCount()}
-async function changeCart(id,q){q=Math.max(1,Number(q));const u=await waitAuth();if(u&&db)await setUserItem('cart',id,{productId:id,quantity:q,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});else{const c=localCart();c[id]=q;saveLocalCart(c)}updateCartCount()}
-async function toggleWish(id){
-  const u=await waitAuth(),ids=await getWish(),has=ids.includes(id);
-  if(has){if(u&&db)await removeUserItem('wishlist',id);else localStorage.setItem(LS.wish,JSON.stringify(ids.filter(x=>x!==id)));toast('উইশলিস্ট থেকে সরানো হয়েছে')}
-  else{if(u&&db)await setUserItem('wishlist',id,{productId:id,createdAt:firebase.firestore.FieldValue.serverTimestamp()});else localStorage.setItem(LS.wish,JSON.stringify([...ids,id]));toast('উইশলিস্টে যোগ হয়েছে')}
-  return !has;
-}
-async function updateCartCount(){const c=await getCart();let n=0;if(c)Object.values(c).forEach(v=>n+=typeof v==='number'?v:Number(v?.quantity||0));$$('#cartCount,#bottomCartCount').forEach(e=>e.textContent=n>99?'99+':n)}
-function toast(t){let e=$('#bbToast');if(!e){e=document.createElement('div');e.id='bbToast';e.className='toast';document.body.appendChild(e)}e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2400)}
-
-function bindCards(){
-  if(document.body.dataset.cardsBound)return;document.body.dataset.cardsBound='1';
-  document.addEventListener('click',async e=>{
-    const b=e.target.closest('[data-add]');if(b){e.preventDefault();await addCart(b.dataset.add);return}
-    const w=e.target.closest('[data-wish]');if(w){e.preventDefault();const added=await toggleWish(w.dataset.wish);w.textContent=added?'♥':'♡';return}
-  });
-}
-
-async function initHome(){
-  applySite();bindCards();showLoader(true);const ps=await loadProducts();
-  const cats=[...new Set(ps.map(p=>p.category).filter(Boolean))];
-  if($('#categories')) $('#categories').innerHTML=cats.map(c=>`<button class="chip" data-cat="${esc(c)}">${esc(c)}</button>`).join('')||'<span class="muted">ক্যাটাগরি নেই</span>';
-  renderGrid(ps);
-  if($('#categories')) $('#categories').onclick=e=>{const b=e.target.closest('[data-cat]');if(b)renderGrid(ps.filter(p=>p.category===b.dataset.cat))};
-  await updateCartCount();showLoader(false);
-}
-function renderGrid(ps){if($('#productCount'))$('#productCount').textContent=`${ps.length.toLocaleString('bn-BD')}টি পণ্য`;if($('#productGrid'))$('#productGrid').innerHTML=ps.map(p=>card(p)).join('');if($('#emptyProducts'))$('#emptyProducts').classList.toggle('hidden',ps.length>0)}
-
-async function initSearch(){applySite();bindCards();const ps=await loadProducts(),input=$('#searchInput');const render=()=>{const q=input.value.trim().toLowerCase();const out=ps.filter(p=>[p.title,p.category,p.id,p.slug].join(' ').toLowerCase().includes(q));$('#searchMeta').textContent=`${out.length.toLocaleString('bn-BD')}টি ফলাফল`;$(`#searchGrid`).innerHTML=out.map(p=>card(p)).join('');$('#searchEmpty').classList.toggle('hidden',out.length>0)};input.addEventListener('input',render);$('#clearSearch').onclick=()=>{input.value='';render();input.focus()};render();await updateCartCount()}
-
-async function initWishlist(){applySite();bindCards();const ps=await loadProducts(),ids=await getWish();const out=ids.map(id=>ps.find(p=>String(p.id)===String(id))).filter(Boolean);$('#wishlistGrid').innerHTML=out.map(p=>card(p)).join('');$('#wishlistEmpty').classList.toggle('hidden',out.length>0);await updateCartCount()}
-
-async function initCart(){
-  applySite();bindCards();const ps=await loadProducts(),c=await getCart();
-  const entries=Object.entries(c||{}).map(([id,v])=>({p:ps.find(x=>String(x.id)===String(id)),q:typeof v==='number'?v:Number(v?.quantity||1)})).filter(x=>x.p);
-  if(!entries.length){$('#cartEmpty').classList.remove('hidden');$('#cartSummary').classList.add('hidden');await updateCartCount();return}
-  $('#cartEmpty').classList.add('hidden');$('#cartSummary').classList.remove('hidden');
-  $('#cartItems').innerHTML=entries.map(({p,q})=>`<div class="cart-item"><div class="cart-img">${p.image?`<img src="${esc(safeUrl(p.image))}" alt="">`:''}</div><div class="cart-info"><a href="${productHref(p)}">${esc(p.title)}</a><b>${fmt(p.price)}</b><div class="qty"><button data-q="-" data-id="${esc(p.id)}">−</button><span>${q}</span><button data-q="+" data-id="${esc(p.id)}">+</button><button class="remove" data-remove="${esc(p.id)}">সরান</button></div></div></div>`).join('');
-  const total=entries.reduce((s,x)=>s+Number(x.p.price||0)*x.q,0),delivery=total?60:0;
-  $('#subtotal').textContent=fmt(total);$('#delivery').textContent=fmt(delivery);$('#total').textContent=fmt(total+delivery);
-  $('#cartItems').onclick=async e=>{const q=e.target.closest('[data-q]');if(q){const cur=entries.find(x=>x.p.id===q.dataset.id)?.q||1;await changeCart(q.dataset.id,cur+(q.dataset.q==='+'?1:-1));initCart();return}const r=e.target.closest('[data-remove]');if(r){await removeCart(r.dataset.remove);initCart()}};
-  $('#checkoutBtn').onclick=async()=>buyCart(entries,total,delivery);
-  await updateCartCount();
-}
-
-function normalizePhone(p){let x=String(p||'').replace(/[^0-9+]/g,'');if(x.startsWith('+'))x=x.slice(1);if(x.startsWith('0'))x='880'+x.slice(1);if(x.startsWith('88')&&!x.startsWith('880'))x='880'+x.slice(2);return x}
-function requireProfile(d){return d&&String(d.name||'').trim()&&String(d.phone||'').trim()&&String(d.address||'').trim()&&String(d.city||'').trim()&&String(d.district||'').trim()}
-function whatsappUrl(message){return 'https://wa.me/'+WHATSAPP_NUMBER+'?text='+encodeURIComponent(message)}
-async function getCustomer(){
-  const u=await waitAuth();
-  if(!u){toast('Buy Now করতে আগে লগইন করুন');location.href=rootPrefix()+'profile.html?next='+encodeURIComponent(location.href);return null}
-  const d=await getUserDoc(u.uid)||{};const data={...d,email:d.email||u.email||'',uid:u.uid};
-  if(!requireProfile(data)){toast('আগে প্রোফাইলে নাম, ফোন ও ঠিকানা পূরণ করুন');location.href=rootPrefix()+'profile.html?next='+encodeURIComponent(location.href);return null}
-  return data;
-}
-function productMessage(p,user,qty=1){
-  const link=siteUrl('products/'+encodeURIComponent(String(p.slug||p.id))+'.html');
-  const subtotal=Number(p.price||0)*qty;
-  return `আসসালামু আলাইকুম। আমি BanglaBazar থেকে এই পণ্যটি কিনতে চাই।\n\n📦 পণ্যের তথ্য\nপণ্য: ${p.title}\nProduct ID: ${p.id}\nপরিমাণ: ${qty}\nমূল্য: ${fmt(p.price)}\nমোট: ${fmt(subtotal)}\n\n🔗 পণ্যের লিংক:\n${link}\n\n👤 ক্রেতার তথ্য\nনাম: ${user.name}\nফোন: ${user.phone}\nইমেইল: ${user.email||'N/A'}\nঠিকানা: ${user.address}\nশহর: ${user.city}\nজেলা: ${user.district}\nCustomer ID: ${user.uid}\n\nআমি অর্ডারটি নিশ্চিত করতে চাই।`;
-}
-async function saveOrder(user,items,total,delivery,type){
-  if(!db||!user?.uid)return null;
-  const ref=db.collection('users').doc(user.uid).collection('orders').doc();
-  const payload={orderId:ref.id,customerId:user.uid,customerName:user.name,phone:user.phone,email:user.email||'',address:user.address,city:user.city,district:user.district,items:items.map(x=>({productId:x.p.id,title:x.p.title,quantity:x.q,price:Number(x.p.price||0),url:siteUrl('products/'+encodeURIComponent(String(x.p.slug||x.p.id))+'.html')})),subtotal:Number(total||0),delivery:Number(delivery||0),grandTotal:Number(total||0)+Number(delivery||0),channel:'WhatsApp',type:type||'product',status:'whatsapp_opened',createdAt:firebase.firestore.FieldValue.serverTimestamp()};
-  try{await ref.set(payload);return ref.id}catch(e){console.warn('Order save failed:',e);return null}
-}
-async function buyNow(p,qty=1){
-  const user=await getCustomer();if(!user)return;
-  const total=Number(p.price||0)*qty,delivery=60;await saveOrder(user,[{p,q:qty}],total,delivery,'buy_now');
-  location.href=whatsappUrl(productMessage(p,user,qty));
-}
-async function buyCart(entries,total,delivery){
-  const user=await getCustomer();if(!user)return;
-  const lines=entries.map((x,i)=>`${i+1}. ${x.p.title}\nProduct ID: ${x.p.id}\nপরিমাণ: ${x.q}\nমূল্য: ${fmt(x.p.price)} × ${x.q} = ${fmt(Number(x.p.price||0)*x.q)}\nলিংক: ${siteUrl('products/'+encodeURIComponent(String(x.p.slug||x.p.id))+'.html')}`).join('\n\n');
-  const message=`আসসালামু আলাইকুম। আমি BanglaBazar-এর কার্টের পণ্যগুলো কিনতে চাই।\n\n🛒 অর্ডারের পণ্য\n${lines}\n\n💰 সাবটোটাল: ${fmt(total)}\n🚚 ডেলিভারি: ${fmt(delivery)}\n💵 সর্বমোট: ${fmt(Number(total)+Number(delivery))}\n\n👤 ক্রেতার তথ্য\nনাম: ${user.name}\nফোন: ${user.phone}\nইমেইল: ${user.email||'N/A'}\nঠিকানা: ${user.address}\nশহর: ${user.city}\nজেলা: ${user.district}\nCustomer ID: ${user.uid}\n\nআমি অর্ডারটি নিশ্চিত করতে চাই।`;
-  await saveOrder(user,entries,total,delivery,'cart_checkout');location.href=whatsappUrl(message);
-}
-
-async function initProfile(){
-  applySite();
-  const next=new URLSearchParams(location.search).get('next');
-  if(!auth){$('#profileLoading').classList.add('hidden');$('#authBox').classList.remove('hidden');return}
-  auth.onAuthStateChanged(async u=>{
-    $('#profileLoading').classList.add('hidden');
-    if(!u){$('#authBox').classList.remove('hidden');$('#profileForm').classList.add('hidden');return}
-    $('#authBox').classList.add('hidden');$('#profileForm').classList.remove('hidden');$('#profileEmail').value=u.email||'';
-    const d=await getUserDoc(u.uid)||{};
-    $('#name').value=d.name||u.displayName||'';$('#phone').value=d.phone||'';$('#address').value=d.address||'';$('#city').value=d.city||'';$('#district').value=d.district||'';
-    await migrateLocalDataToFirebase(u);updateCartCount();
-  });
-  $('#loginBtn').onclick=async()=>{try{await auth.signInWithEmailAndPassword($('#email').value.trim(),$('#password').value);$('#authMsg').className='form-msg ok';$('#authMsg').textContent='লগইন সফল হয়েছে।';if(next)setTimeout(()=>location.href=next,300)}catch(e){$('#authMsg').className='form-msg';$('#authMsg').textContent=friendlyAuthError(e)}};
-  $('#signupBtn').onclick=async()=>{try{const em=$('#email').value.trim(),pw=$('#password').value;if(pw.length<6)throw Error('পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।');const c=await auth.createUserWithEmailAndPassword(em,pw);await db.collection('users').doc(c.user.uid).set({email:em,name:'',phone:'',address:'',city:'',district:'',createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});$('#authMsg').className='form-msg ok';$('#authMsg').textContent='অ্যাকাউন্ট তৈরি হয়েছে। এখন প্রোফাইল তথ্য পূরণ করুন।'}catch(e){$('#authMsg').className='form-msg';$('#authMsg').textContent=friendlyAuthError(e)}};
-  $('#profileForm').onsubmit=async e=>{e.preventDefault();const u=auth.currentUser;if(!u)return;try{await db.collection('users').doc(u.uid).set({name:$('#name').value.trim(),phone:$('#phone').value.trim(),email:u.email||'',address:$('#address').value.trim(),city:$('#city').value.trim(),district:$('#district').value.trim(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});$('#profileMsg').className='form-msg ok';$('#profileMsg').textContent='প্রোফাইল সফলভাবে সেভ হয়েছে।';if(next)setTimeout(()=>location.href=next,450)}catch(err){$('#profileMsg').className='form-msg';$('#profileMsg').textContent=err.message}}
-  $('#logoutBtn').onclick=()=>auth.signOut();
-}
-function friendlyAuthError(e){const c=e?.code||'';if(c.includes('invalid-credential')||c.includes('wrong-password'))return'ইমেইল বা পাসওয়ার্ড সঠিক নয়।';if(c.includes('email-already-in-use'))return'এই ইমেইল দিয়ে আগে থেকেই অ্যাকাউন্ট আছে।';if(c.includes('invalid-email'))return'সঠিক ইমেইল দিন।';return e?.message||'একটি সমস্যা হয়েছে।'}
-
-function slugFromPath(){const m=location.pathname.match(/\/products\/([^/]+)\.html$/i);return m?decodeURIComponent(m[1]):null}
-async function initProductPage(){
-  applySite();bindCards();showLoader(false);
-  const slug=slugFromPath();const ps=await loadProducts(true);const p=ps.find(x=>String(x.slug||x.id)===String(slug)||String(x.id)===String(slug));
-  $('#productLoading').classList.add('hidden');
-  if(!p){$('#productError').classList.remove('hidden');$('#productErrorText').textContent=ps.length?'এই ID-এর কোনো পণ্য পাওয়া যায়নি।':'পণ্যের তালিকা লোড করা যায়নি।';await updateCartCount();return}
-  document.title=p.title+' — BanglaBazar';$('#productView').classList.remove('hidden');$('#productTitle').textContent=p.title;$('#productPrice').textContent=fmt(p.price);$('#productOldPrice').textContent=p.oldPrice?fmt(p.oldPrice):'';$('#productMeta').innerHTML=`<span class="chip">${esc(p.category||'পণ্য')}</span>`;
-  const imgs=[p.image,...(p.images||[])].filter(Boolean);$('#productGallery').innerHTML=imgs.length?`<div class="gallery">${imgs.map(x=>`<img src="${esc(safeUrl(x))}" alt="${esc(p.title)}" loading="lazy">`).join('')}</div>`:'<div class="gallery no-image">ছবি নেই</div>';
-  $('#addCart').onclick=()=>addCart(p.id);$('#buyNow').onclick=()=>buyNow(p,1);
-  $('#addWishlist').onclick=async()=>{const added=await toggleWish(p.id);$('#addWishlist').textContent=added?'♥':'♡'};
-  const vids=(p.youtube||[]).filter(Boolean);$('#youtubeBox').innerHTML=vids.length?`<h2>ভিডিও</h2>${vids.map(v=>{const id=(String(v).match(/(?:youtu\.be\/|v=|embed\/)([\w-]{6,})/)||[])[1];return id?`<div class="video"><iframe src="https://www.youtube.com/embed/${esc(id)}" title="YouTube video" loading="lazy" allowfullscreen></iframe></div>`:`<a href="${esc(safeUrl(v))}" target="_blank" rel="noopener">YouTube ভিডিও দেখুন</a>`}).join('')}`:'';
-  let md='';try{const r=await fetch(new URL(rootPrefix()+(p.description||''),location.href).href+'?v='+Date.now(),{cache:'no-store'});if(r.ok)md=await r.text()}catch(e){console.warn('Description load:',e)}$('#descriptionContent').innerHTML=markdown(md||p.description||'');
-  const related=ps.filter(x=>String(x.id)!==String(p.id)&&x.category===p.category).slice(0,6);$('#relatedGrid').innerHTML=related.map(x=>card(x,true)).join('');$('#relatedSection').classList.toggle('hidden',!related.length);await updateCartCount();
-}
-function markdown(s){let x=esc(s).replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/^> (.*)$/gm,'<blockquote>$1</blockquote>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\*(.*?)\*/g,'<em>$1</em>').replace(/`(.*?)`/g,'<code>$1</code>').replace(/!\[(.*?)\]\((.*?)\)/g,'<img src="$2" alt="$1" loading="lazy">').replace(/\[(.*?)\]\((.*?)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');x=x.replace(/(^|\n)- (.*)/g,'$1<li>$2</li>');x=x.replace(/(<li>.*<\/li>)(?:\n|$)/g,'<ul>$1</ul>');return x.split(/\n\s*\n/).map(b=>/^<(h1|h2|h3|ul|blockquote)/.test(b.trim())?b:`<p>${b.replace(/\n/g,'<br>')}</p>`).join('')}
-
-window.BB={initHome,initSearch,initWishlist,initCart,initProfile,initProductPage,loadProducts,addCart,applySite,fmt,buyNow,toggleWish,updateCartCount};
+(function(){'use strict';
+const CFG=window.BB_FIREBASE_CONFIG||{};const WHATSAPP_DEFAULT='8801949737370';const LS={cart:'bb_cart_v5',wish:'bb_wish_v5',site:'bb_site_cache_v5'};let db=null,auth=null,productsCache=null,siteCache=null,authReady=null;
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));const safeUrl=s=>String(s||'').trim().replace(/^javascript:/i,'');
+try{if(window.firebase){if(!firebase.apps.length)firebase.initializeApp(CFG);auth=firebase.auth();db=firebase.firestore();authReady=new Promise(r=>auth.onAuthStateChanged(r));}}catch(e){console.error(e)}
+function isProductPage(){return /\/products\/[^/]+\.html$/i.test(location.pathname)}function rootPrefix(){return isProductPage()?'../':''}function productHref(p){return rootPrefix()+'products/'+encodeURIComponent(String(p.slug||p.id))+'.html'}function siteUrl(path){return new URL(rootPrefix()+path,location.href).href}
+function defaultSite(){return {name:'BanglaBazar',logo:'',favicon:'',primary:'#1769d1',button:'#1769d1',buttonText:'#fff',background:'#f6f8fb',card:'#fff',text:'#17212b',muted:'#6b7685',border:'#e3e8ef',currency:'৳',deliveryFee:60,showPrices:true,heroTitle:'BanglaBazar',heroText:'পছন্দের পণ্য সহজেই খুঁজুন এবং কার্টে যোগ করুন।',heroEyebrow:'আপনার অনলাইন শপ',heroImage:'',announcement:'',footerText:'বিশ্বস্ত অনলাইন শপ',contactPhone:'01949737370',whatsapp:WHATSAPP_DEFAULT,facebook:'',instagram:'',youtube:'',showCategories:true,showRelated:true,showReviews:true,showVideos:true,showWishlist:true,showCart:true,showSearch:true,seoTitle:'BanglaBazar — আপনার অনলাইন শপ',seoDescription:'BanglaBazar অনলাইন শপ।'}}
+async function loadSite(force=false){if(siteCache&&!force)return siteCache;let s=defaultSite();try{const r=await fetch(rootPrefix()+'data/site.json?v='+Date.now(),{cache:'no-store'});if(r.ok)s={...s,...await r.json()}}catch{}try{const local=JSON.parse(localStorage.getItem(LS.site)||'{}');s={...s,...local}}catch{}siteCache=s;return s}
+function applySite(s){s=s||siteCache||defaultSite();document.documentElement.style.setProperty('--primary',s.primary);document.documentElement.style.setProperty('--button',s.button);document.documentElement.style.setProperty('--button-text',s.buttonText);document.documentElement.style.setProperty('--bg',s.background);document.documentElement.style.setProperty('--surface',s.card);document.documentElement.style.setProperty('--text',s.text);document.documentElement.style.setProperty('--muted',s.muted);document.documentElement.style.setProperty('--border',s.border);$$('#brandName').forEach(e=>e.textContent=s.name);$$('.brand-logo').forEach(e=>e.innerHTML=s.logo?`<img src="${esc(s.logo)}" alt="${esc(s.name)}">`:'B');$$('#heroTitle').forEach(e=>e.textContent=s.heroTitle);$$('#heroText').forEach(e=>e.textContent=s.heroText);$$('#heroEyebrow').forEach(e=>e.textContent=s.heroEyebrow);$$('#announcement').forEach(e=>{e.textContent=s.announcement;e.classList.toggle('hidden',!s.announcement)});$$('#hero').forEach(e=>{if(s.heroImage)e.style.backgroundImage=`linear-gradient(90deg,rgba(0,0,0,.55),rgba(0,0,0,.08)),url("${safeUrl(s.heroImage)}")`});if(s.favicon){let l=document.querySelector('link[rel="icon"]');if(!l){l=document.createElement('link');l.rel='icon';document.head.appendChild(l)}l.href=s.favicon}document.title=s.seoTitle||s.name;let m=document.querySelector('meta[name="description"]');if(m)m.content=s.seoDescription||''}
+async function getSite(){return loadSite()}
+function showLoader(v){$('#app-loader')?.classList.toggle('hidden',!v)}function fmt(n){const s=siteCache||defaultSite();return `${s.currency||'৳'}${Number(n||0).toLocaleString('bn-BD')}`}
+async function loadProducts(force=false){if(productsCache&&!force)return productsCache;try{const r=await fetch(rootPrefix()+'data/products.json?v='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const j=await r.json();productsCache=Array.isArray(j)?j:(j.products||[])}catch(e){console.error(e);productsCache=[]}return productsCache}
+function card(p,compact=false){const img=p.image||p.images?.[0]||'';return `<article class="product-card ${compact?'compact':''}"><a href="${productHref(p)}" class="product-image">${img?`<img loading="lazy" src="${esc(safeUrl(img))}" alt="${esc(p.title)}" onerror="this.remove()">`:'<span>'+icon('image')+'ছবি নেই</span>'}</a><div class="product-body"><a class="product-title" href="${productHref(p)}">${esc(p.title)}</a>${p.shortDescription?`<p class="product-short">${esc(p.shortDescription)}</p>`:''}${(siteCache?.showPrices!==false)?`<div class="price">${fmt(p.price)} ${p.oldPrice?`<del>${fmt(p.oldPrice)}</del>`:''}</div>`:''}<div class="card-actions"><button class="mini-cart" data-add="${esc(p.id)}">${icon('cart')}কার্টে যোগ</button>${siteCache?.showWishlist!==false?`<button class="mini-wish" data-wish="${esc(p.id)}" aria-label="Wishlist">${icon('heart')}</button>`:''}</div></div></article>`}
+function localCart(){try{return JSON.parse(localStorage.getItem(LS.cart)||'{}')}catch{return {}}}function localWish(){try{return JSON.parse(localStorage.getItem(LS.wish)||'[]')}catch{return []}}function saveLocalCart(c){localStorage.setItem(LS.cart,JSON.stringify(c));updateCartCount()}
+async function waitAuth(){if(!auth)return null;if(authReady)return authReady;return auth.currentUser}async function getUserDoc(uid){if(!db||!uid)return null;try{const s=await db.collection('users').doc(uid).get();return s.exists?s.data():null}catch(e){console.warn(e);return null}}
+async function getUserItems(type){const u=await waitAuth();if(!u||!db)return null;try{const snap=await db.collection('users').doc(u.uid).collection(type).get();const out={};snap.forEach(d=>out[d.id]=d.data());return out}catch(e){console.warn(e);return null}}
+async function setUserItem(type,id,data){const u=await waitAuth();if(!u||!db)return false;try{await db.collection('users').doc(u.uid).collection(type).doc(id).set(data,{merge:true});return true}catch(e){console.warn(e);return false}}async function removeUserItem(type,id){const u=await waitAuth();if(!u||!db)return false;try{await db.collection('users').doc(u.uid).collection(type).doc(id).delete();return true}catch{return false}}
+async function getCart(){return await getUserItems('cart')??localCart()}async function getWish(){const x=await getUserItems('wishlist');return x?Object.keys(x):localWish()}
+async function migrateLocalData(u){if(!u||!db)return;const c=localCart(),w=localWish();try{const b=db.batch();Object.entries(c).forEach(([id,v])=>b.set(db.collection('users').doc(u.uid).collection('cart').doc(id),{productId:id,quantity:Number(v?.quantity||v||1),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true}));w.forEach(id=>b.set(db.collection('users').doc(u.uid).collection('wishlist').doc(id),{productId:id,createdAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true}));if(Object.keys(c).length||w.length)await b.commit();localStorage.removeItem(LS.cart);localStorage.removeItem(LS.wish)}catch(e){console.warn(e)}}
+async function addCart(id,q=1){const u=await waitAuth();if(u&&db){const r=db.collection('users').doc(u.uid).collection('cart').doc(id);const s=await r.get();await r.set({productId:id,quantity:(s.exists?Number(s.data().quantity||0):0)+q,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true})}else{const c=localCart();c[id]=Number(c[id]||0)+q;saveLocalCart(c)}updateCartCount();toast('কার্টে যোগ হয়েছে')}
+async function removeCart(id){const u=await waitAuth();if(u&&db)await removeUserItem('cart',id);else{const c=localCart();delete c[id];saveLocalCart(c)}updateCartCount()}async function changeCart(id,q){q=Math.max(1,Number(q));const u=await waitAuth();if(u&&db)await setUserItem('cart',id,{productId:id,quantity:q,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});else{const c=localCart();c[id]=q;saveLocalCart(c)}updateCartCount()}
+async function toggleWish(id){const u=await waitAuth(),ids=await getWish(),has=ids.includes(id);if(has){if(u&&db)await removeUserItem('wishlist',id);else localStorage.setItem(LS.wish,JSON.stringify(ids.filter(x=>x!==id)));toast('উইশলিস্ট থেকে সরানো হয়েছে')}else{if(u&&db)await setUserItem('wishlist',id,{productId:id,createdAt:firebase.firestore.FieldValue.serverTimestamp()});else localStorage.setItem(LS.wish,JSON.stringify([...ids,id]));toast('উইশলিস্টে যোগ হয়েছে')}return !has}
+async function updateCartCount(){const c=await getCart();let n=0;Object.values(c||{}).forEach(v=>n+=typeof v==='number'?v:Number(v?.quantity||0));$$('#cartCount,#bottomCartCount').forEach(e=>e.textContent=n>99?'99+':n)}function toast(t){let e=$('#bbToast');if(!e){e=document.createElement('div');e.id='bbToast';e.className='toast';document.body.appendChild(e)}e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2400)}
+function bindCards(){if(document.body.dataset.bound)return;document.body.dataset.bound='1';document.addEventListener('click',async e=>{const b=e.target.closest('[data-add]');if(b){e.preventDefault();b.disabled=true;try{await addCart(b.dataset.add)}finally{b.disabled=false}}const w=e.target.closest('[data-wish]');if(w){e.preventDefault();w.classList.add('busy');try{const a=await toggleWish(w.dataset.wish);w.innerHTML=icon('heart',a?'filled':'')}finally{w.classList.remove('busy')}}})}
+async function initShell(){const s=await loadSite();applySite(s);bindCards();await updateCartCount()}
+async function initHome(){await initShell();showLoader(true);const ps=await loadProducts();const cats=[...new Set(ps.map(p=>p.category).filter(Boolean))];if($('#categories'))$('#categories').innerHTML=cats.map(c=>`<button class="chip" data-cat="${esc(c)}">${esc(c)}</button>`).join('');renderGrid(ps);$('#categories')?.addEventListener('click',e=>{const b=e.target.closest('[data-cat]');if(b)renderGrid(ps.filter(p=>p.category===b.dataset.cat))});showLoader(false)}function renderGrid(ps){$('#productCount')&&( $('#productCount').textContent=`${ps.length.toLocaleString('bn-BD')}টি পণ্য`);if($('#productGrid'))$('#productGrid').innerHTML=ps.map(p=>card(p)).join('');$('#emptyProducts')?.classList.toggle('hidden',ps.length>0)}
+async function initSearch(){await initShell();const ps=await loadProducts(),i=$('#searchInput');const render=()=>{const q=i.value.trim().toLowerCase();const out=ps.filter(p=>[p.title,p.category,p.id,p.slug,...(p.tags||[])].join(' ').toLowerCase().includes(q));$('#searchMeta').textContent=`${out.length.toLocaleString('bn-BD')}টি ফলাফল`;$(`#searchGrid`).innerHTML=out.map(p=>card(p)).join('');$('#searchEmpty').classList.toggle('hidden',out.length>0)};i.addEventListener('input',render);$('#clearSearch').onclick=()=>{i.value='';render();i.focus()};render()}
+async function initWishlist(){await initShell();const ps=await loadProducts(),ids=await getWish(),out=ids.map(id=>ps.find(p=>String(p.id)===String(id))).filter(Boolean);$('#wishlistGrid').innerHTML=out.map(p=>card(p)).join('');$('#wishlistEmpty').classList.toggle('hidden',out.length>0)}
+async function initCart(){await initShell();const ps=await loadProducts(),c=await getCart(),entries=Object.entries(c||{}).map(([id,v])=>({p:ps.find(x=>String(x.id)===String(id)),q:typeof v==='number'?v:Number(v?.quantity||1)})).filter(x=>x.p);if(!entries.length){$('#cartEmpty').classList.remove('hidden');$('#cartSummary').classList.add('hidden');return}$('#cartEmpty').classList.add('hidden');$('#cartSummary').classList.remove('hidden');$('#cartItems').innerHTML=entries.map(x=>`<div class="cart-item"><div class="cart-img"><img src="${esc(safeUrl(x.p.image||x.p.images?.[0]||''))}" alt=""></div><div class="cart-info"><a href="${productHref(x.p)}">${esc(x.p.title)}</a><b>${fmt(x.p.price)}</b><div class="qty"><button data-q="-" data-id="${esc(x.p.id)}">${icon('minus')}</button><span>${x.q}</span><button data-q="+" data-id="${esc(x.p.id)}">${icon('plus')}</button><button class="remove" data-remove="${esc(x.p.id)}">${icon('trash')}সরান</button></div></div></div>`).join('');const total=entries.reduce((a,x)=>a+Number(x.p.price||0)*x.q,0),delivery=Number((siteCache||defaultSite()).deliveryFee||0);$('#subtotal').textContent=fmt(total);$('#delivery').textContent=fmt(delivery);$('#total').textContent=fmt(total+delivery);$('#cartItems').onclick=async e=>{const q=e.target.closest('[data-q]');if(q){const cur=entries.find(x=>x.p.id===q.dataset.id)?.q||1;await changeCart(q.dataset.id,cur+(q.dataset.q==='+'?1:-1));initCart();return}const r=e.target.closest('[data-remove]');if(r){await removeCart(r.dataset.remove);initCart()}};$('#checkoutBtn').onclick=()=>buyCart(entries,total,delivery)}
+function normalizePhone(p){let x=String(p||'').replace(/[^0-9+]/g,'');if(x.startsWith('+'))x=x.slice(1);if(x.startsWith('0'))x='880'+x.slice(1);return x}
+function requireProfile(d){return d&&d.name&&d.phone&&d.address&&d.city&&d.district}async function getCustomer(){const u=await waitAuth();if(!u){toast('অর্ডার করতে আগে অ্যাকাউন্টে লগইন করুন');location.href=rootPrefix()+'profile.html?next='+encodeURIComponent(location.href);return null}const d=await getUserDoc(u.uid)||{};const x={...d,email:d.email||u.email||'',uid:u.uid};if(!requireProfile(x)){toast('প্রোফাইলে নাম, ফোন, ঠিকানা, শহর ও জেলা পূরণ করুন');location.href=rootPrefix()+'profile.html?next='+encodeURIComponent(location.href);return null}return x}
+function whatsappUrl(message){return 'https://wa.me/'+normalizePhone(siteCache?.whatsapp||WHATSAPP_DEFAULT)+'?text='+encodeURIComponent(message)}function productMessage(p,u,q){const link=siteUrl('products/'+encodeURIComponent(p.slug||p.id)+'.html');return `আসসালামু আলাইকুম। আমি BanglaBazar থেকে এই পণ্যটি কিনতে চাই।\n\n📦 পণ্য: ${p.title}\nProduct ID: ${p.id}\nপরিমাণ: ${q}\nমূল্য: ${fmt(p.price)}\nমোট: ${fmt(Number(p.price||0)*q)}\n\n🔗 পণ্যের লিংক:\n${link}\n\n👤 ক্রেতার তথ্য\nনাম: ${u.name}\nফোন: ${u.phone}\nইমেইল: ${u.email||'N/A'}\nঠিকানা: ${u.address}\nশহর: ${u.city}\nজেলা: ${u.district}\nCustomer ID: ${u.uid}`}
+async function saveOrder(u,items,total,delivery,type){if(!db)return;try{const ref=db.collection('users').doc(u.uid).collection('orders').doc();await ref.set({orderId:ref.id,customerId:u.uid,customerName:u.name,phone:u.phone,email:u.email||'',address:u.address,city:u.city,district:u.district,items:items.map(x=>({productId:x.p.id,title:x.p.title,quantity:x.q,price:Number(x.p.price||0),url:siteUrl('products/'+encodeURIComponent(x.p.slug||x.p.id)+'.html')})),subtotal:total,delivery,grandTotal:total+delivery,channel:'WhatsApp',status:'whatsapp_opened',createdAt:firebase.firestore.FieldValue.serverTimestamp()})}catch(e){console.warn(e)}}
+async function buyNow(p,q=1){const u=await getCustomer();if(!u)return;await saveOrder(u,[{p,q}],Number(p.price||0)*q,Number(siteCache?.deliveryFee||0),'buy_now');location.href=whatsappUrl(productMessage(p,u,q))}
+async function buyCart(es,total,delivery){const u=await getCustomer();if(!u)return;const lines=es.map((x,i)=>`${i+1}. ${x.p.title}\nID: ${x.p.id}\nপরিমাণ: ${x.q}\nমূল্য: ${fmt(Number(x.p.price||0)*x.q)}\n🔗 ${siteUrl('products/'+encodeURIComponent(x.p.slug||x.p.id)+'.html')}`).join('\n\n');const msg=`আসসালামু আলাইকুম। আমি BanglaBazar-এর কার্টের পণ্যগুলো কিনতে চাই।\n\n${lines}\n\nসাবটোটাল: ${fmt(total)}\nডেলিভারি: ${fmt(delivery)}\nসর্বমোট: ${fmt(total+delivery)}\n\n👤 ক্রেতার তথ্য\nনাম: ${u.name}\nফোন: ${u.phone}\nইমেইল: ${u.email||'N/A'}\nঠিকানা: ${u.address}\nশহর: ${u.city}\nজেলা: ${u.district}\nCustomer ID: ${u.uid}`;await saveOrder(u,es,total,delivery,'cart_checkout');location.href=whatsappUrl(msg)}
+function authError(e){const c=e?.code||'';if(c.includes('operation-not-allowed'))return'Firebase Authentication-এ Email/Password sign-in চালু নেই। Firebase Console → Authentication → Sign-in method থেকে Email/Password Enable করুন।';if(c.includes('network'))return'ইন্টারনেট সংযোগ বা Firebase সার্ভিসে সমস্যা।';if(c.includes('invalid-credential')||c.includes('wrong-password'))return'ইমেইল বা পাসওয়ার্ড সঠিক নয়।';if(c.includes('email-already-in-use'))return'এই ইমেইল দিয়ে আগে থেকেই অ্যাকাউন্ট আছে।';if(c.includes('weak-password'))return'পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।';return e?.message||'একটি সমস্যা হয়েছে।'}
+async function initProfile(){await initShell();const next=new URLSearchParams(location.search).get('next');if(!auth){$('#profileLoading').innerHTML='Firebase SDK/config পাওয়া যাচ্ছে না।';return}auth.onAuthStateChanged(async u=>{if(!u){$('#profileLoading').classList.add('hidden');$('#authBox').classList.remove('hidden');$('#profileForm').classList.add('hidden');return}$('#profileLoading').classList.add('hidden');$('#authBox').classList.add('hidden');$('#profileForm').classList.remove('hidden');$('#profileEmail').value=u.email||'';const d=await getUserDoc(u.uid)||{};$('#name').value=d.name||'';$('#phone').value=d.phone||'';$('#address').value=d.address||'';$('#city').value=d.city||'';$('#district').value=d.district||'';setAvatar(d.avatar||'');migrateLocalData(u)});$('#loginBtn').onclick=async()=>{try{await auth.signInWithEmailAndPassword($('#email').value.trim(),$('#password').value);$('#authMsg').textContent='লগইন সফল হয়েছে।';$('#authMsg').className='form-msg ok';if(next)setTimeout(()=>location.href=next,350)}catch(e){$('#authMsg').textContent=authError(e);$('#authMsg').className='form-msg'}};$('#signupBtn').onclick=async()=>{try{const em=$('#email').value.trim(),pw=$('#password').value;if(pw.length<6)throw Error('পাসওয়ার্ড কমপক্ষে ৬ অক্ষরের হতে হবে।');const c=await auth.createUserWithEmailAndPassword(em,pw);await db.collection('users').doc(c.user.uid).set({email:em,name:'',phone:'',address:'',city:'',district:'',avatar:'',createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});$('#authMsg').textContent='অ্যাকাউন্ট তৈরি হয়েছে। নিচে তথ্য পূরণ করুন।';$('#authMsg').className='form-msg ok'}catch(e){$('#authMsg').textContent=authError(e);$('#authMsg').className='form-msg'}};$('#profileForm').onsubmit=async e=>{e.preventDefault();const u=auth.currentUser;if(!u)return;try{await db.collection('users').doc(u.uid).set({name:$('#name').value.trim(),phone:$('#phone').value.trim(),email:u.email||'',address:$('#address').value.trim(),city:$('#city').value.trim(),district:$('#district').value.trim(),avatar:window.BB_PROFILE_AVATAR||$('#avatarData')?.value||'',updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});$('#profileMsg').textContent='প্রোফাইল সেভ হয়েছে।';$('#profileMsg').className='form-msg ok'}catch(e){$('#profileMsg').textContent=e.message;$('#profileMsg').className='form-msg'}};$('#logoutBtn').onclick=()=>auth.signOut()}
+function setAvatar(src){const e=$('#avatar');if(e)e.innerHTML=src?`<img src="${esc(src)}" alt="Profile">`:icon('user')}
+async function initProductPage(){await initShell();showLoader(false);const slug=decodeURIComponent((location.pathname.match(/\/products\/([^/]+)\.html$/i)||[])[1]||'');const ps=await loadProducts(true),p=ps.find(x=>String(x.slug||x.id)===slug||String(x.id)===slug);$('#productLoading').classList.add('hidden');if(!p){$('#productError').classList.remove('hidden');$('#productErrorText').textContent=ps.length?'এই Product ID-এর কোনো পণ্য পাওয়া যায়নি।':'products.json লোড করা যায়নি।';return}document.title=`${p.title} — ${siteCache.name}`;$('#productView').classList.remove('hidden');$('#productTitle').textContent=p.title;$('#productPrice').textContent=fmt(p.price);$('#productOldPrice').textContent=p.oldPrice?fmt(p.oldPrice):'';$('#productMeta').innerHTML=`${p.category?`<span class="chip">${esc(p.category)}</span>`:''}${p.sku?`<span class="chip">SKU: ${esc(p.sku)}</span>`:''}`;const imgs=[p.image,...(p.images||[])].filter(Boolean);$('#productGallery').innerHTML=imgs.length?`<div class="gallery">${imgs.map(x=>`<img src="${esc(safeUrl(x))}" alt="${esc(p.title)}" loading="lazy">`).join('')}</div>`:`<div class="no-image">${icon('image')} ছবি নেই</div>`;$('#addCart').onclick=()=>addCart(p.id);$('#buyNow').onclick=()=>buyNow(p,1);$('#addWishlist').onclick=async()=>{$('#addWishlist').innerHTML=icon('heart',await toggleWish(p.id)?'filled':'')};const vids=p.youtube||[];$('#youtubeBox').innerHTML=(siteCache.showVideos!==false&&vids.length)?`<h2>ভিডিও</h2>${vids.map(v=>{const id=(String(v).match(/(?:youtu\.be\/|v=|embed\/)([\w-]{6,})/)||[])[1];return id?`<div class="video"><iframe src="https://www.youtube.com/embed/${esc(id)}" loading="lazy" allowfullscreen title="Video"></iframe></div>`:`<a class="text-link" href="${esc(safeUrl(v))}" target="_blank" rel="noopener">YouTube ভিডিও</a>`}).join('')}`:'';let md='';try{const r=await fetch(rootPrefix()+(p.description||'')+'?v='+Date.now(),{cache:'no-store'});if(r.ok)md=await r.text()}catch{}$('#descriptionContent').innerHTML=markdown(md||p.shortDescription||'');const related=ps.filter(x=>x.id!==p.id&&x.category===p.category&&x.status!=='hidden').slice(0,6);$('#relatedGrid').innerHTML=related.map(x=>card(x,true)).join('');$('#relatedSection').classList.toggle('hidden',siteCache.showRelated===false||!related.length);if(siteCache.showReviews!==false)await initReviews(p)}
+function markdown(s){let x=esc(s).replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/^> (.*)$/gm,'<blockquote>$1</blockquote>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\*(.*?)\*/g,'<em>$1</em>').replace(/!\[(.*?)\]\((.*?)\)/g,'<img src="$2" alt="$1" loading="lazy">').replace(/\[(.*?)\]\((.*?)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');return x.split(/\n\s*\n/).map(b=>/^<(h1|h2|h3|blockquote)/.test(b.trim())?b:`<p>${b.replace(/\n/g,'<br>')}</p>`).join('')}
+async function initReviews(p){const list=$('#reviewList'),form=$('#reviewForm');try{const snap=await db.collection('products').doc(p.id).collection('reviews').orderBy('createdAt','desc').limit(30).get();let arr=[];snap.forEach(d=>arr.push({id:d.id,...d.data()}));renderReviews(arr)}catch(e){list.innerHTML='<p class="muted">রিভিউ এখন লোড করা যাচ্ছে না।</p>'}if(form)form.onsubmit=async e=>{e.preventDefault();const u=await waitAuth();if(!u){location.href=rootPrefix()+'profile.html?next='+encodeURIComponent(location.href);return}const text=$('#reviewText').value.trim(),rating=Number($('#reviewRating').value);if(!text||rating<1)return;let imgs=[];const files=[...($('#reviewImages').files||[])].slice(0,3);try{for(const f of files)imgs.push(await compressImage(f,900,0.72))}catch(err){$('#reviewMsg').textContent=err.message;return}const user=await getUserDoc(u.uid)||{};await db.collection('products').doc(p.id).collection('reviews').doc(u.uid).set({userId:u.uid,userName:user.name||u.email?.split('@')[0]||'ব্যবহারকারী',userAvatar:user.avatar||'',rating,text,images:imgs,createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});$('#reviewText').value='';$('#reviewImages').value='';$('#reviewMsg').textContent='রিভিউ সেভ হয়েছে।';const s=await db.collection('products').doc(p.id).collection('reviews').get();let a=[];s.forEach(d=>a.push({id:d.id,...d.data()}));renderReviews(a)}}
+function renderReviews(arr){const list=$('#reviewList');if(!list)return;if(!arr.length){list.innerHTML='<div class="empty">এখনও কোনো রিভিউ নেই।</div>';return}const avg=arr.reduce((a,x)=>a+Number(x.rating||0),0)/arr.length;$('#reviewSummary').innerHTML=`<div class="review-average"><strong>${avg.toFixed(1)}</strong><span>${[1,2,3,4,5].map(i=>icon('star',i<=Math.round(avg)?'filled':'')).join('')}</span><small>${arr.length}টি রিভিউ</small></div>`;list.innerHTML=arr.map(x=>`<article class="review-card"><div class="review-head"><div class="review-avatar">${x.userAvatar?`<img src="${esc(x.userAvatar)}" alt="">`:icon('user')}</div><div><b>${esc(x.userName||'ব্যবহারকারী')}</b><div class="stars">${[1,2,3,4,5].map(i=>icon('star',i<=Number(x.rating)?'filled':'')).join('')}</div></div></div><p>${esc(x.text)}</p>${(x.images||[]).length?`<div class="review-images">${x.images.slice(0,3).map(i=>`<img src="${esc(i)}" alt="Review image" loading="lazy">`).join('')}</div>`:''}</article>`).join('')}
+function compressImage(file,max=900,q=.72){return new Promise((res,rej)=>{if(!file.type.startsWith('image/'))return rej(Error('শুধু ছবি নির্বাচন করুন।'));const im=new Image();const rd=new FileReader();rd.onload=()=>{im.onload=()=>{let w=im.width,h=im.height,scale=Math.min(1,max/Math.max(w,h));w=Math.round(w*scale);h=Math.round(h*scale);const c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(im,0,0,w,h);res(c.toDataURL('image/jpeg',q))};im.onerror=()=>rej(Error('ছবি পড়া যায়নি।'));im.src=rd.result};rd.onerror=()=>rej(Error('ফাইল পড়া যায়নি।'));rd.readAsDataURL(file)})}
+window.BB={initHome,initSearch,initWishlist,initCart,initProfile,initProductPage,loadProducts,loadSite,applySite,addCart,buyNow,toggleWish,updateCartCount,compressImage,toast};
 })();

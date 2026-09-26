@@ -1,16 +1,25 @@
 {
-  "version": 3,
+  "version": 5,
   "products": [
     {
       "id": "islamic-history-1-5",
       "slug": "islamic-history-1-5",
       "title": "ইসলামের ইতিহাস (১ম–৫ম খণ্ড)",
       "category": "Islamic",
+      "brand": "",
+      "sku": "",
       "price": 0,
       "oldPrice": 0,
-      "image": "https://pockethostbd.github.io/drive-one/picture/islamer-etihash-1-5.jpg",
+      "stock": 0,
+      "status": "published",
+      "shortDescription": "ইতিহাস জানুন • অতীত থেকে শিক্ষা নিন",
+      "image": "",
       "images": [],
       "youtube": [],
+      "tags": [
+        "Islamic",
+        "ইসলামের ইতিহাস"
+      ],
       "description": "content/islamic-history-1-5.md"
     }
   ]
